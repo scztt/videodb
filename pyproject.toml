@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "videodb"
+version = "0.1.0"
+description = "Per-file video analysis with sidecar caching. Modular passes (description / tags / structured JSON / custom text queries) driven by Qwen2.5-VL."
+authors = [{ name = "scott carver", email = "scott@artificia.org" }]
+requires-python = ">=3.11,<3.14"
+readme = "README.md"
+license = { text = "MIT" }
+
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "toml>=0.10",
+    "numpy>=1.26",
+    # Qwen2.5-VL stack — matches describe_video.py
+    "torch>=2.4",
+    "torchvision>=0.19",
+    "torchcodec>=0.1",
+    "transformers>=4.49",
+    "accelerate>=1.0",
+    "qwen-vl-utils>=0.0.8",
+    "av>=12",
+    "pillow>=10",
+]
+
+[project.scripts]
+videodb = "videodb.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["videodb"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
