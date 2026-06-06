@@ -63,6 +63,10 @@ target — deepest wins.
 sidecar_mapping = "{fullpath}.videodb.json"
 passes = ["text", "json", "tags"]
 model = "Qwen/Qwen2.5-VL-7B-Instruct"
+# Alternatives — Qwen3-VL is the current line (Qwen2.5-VL is maintenance-only).
+# Interleaved-MRoPE in Qwen3-VL specifically improves long-video reasoning.
+# model = "Qwen/Qwen3-VL-8B-Instruct"     # drop-in upgrade from 7B; faster, better video
+# model = "Qwen/Qwen3-VL-32B-Instruct"    # best quality; needs ~32 GB VRAM at FP8, ~64 GB at FP16
 fps = 1.0
 max_tokens = 256
 

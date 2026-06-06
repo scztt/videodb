@@ -1,8 +1,10 @@
-"""Lazy Qwen2.5-VL loader. One instance per process.
+"""Lazy Qwen-VL loader. One instance per process.
 
-Lifted directly from describe_video.py — same model, same prompting
-shape. We only expose a single function: `generate(video, prompt, fps,
-max_tokens)`.
+Originally lifted from describe_video.py. Uses `AutoModelForImageTextToText`
+so both Qwen2.5-VL and Qwen3-VL checkpoints load with the right
+architecture (Qwen3-VL's Interleaved-MRoPE in particular needs the
+qwen3_vl class — instantiating it as qwen2_5_vl silently drops the
+positional encoding).
 
 Loading the 7B model uses ~16GB RAM and takes ~10s. We keep it loaded
 between calls (one process should analyze the whole batch).
@@ -78,7 +80,7 @@ def _ensure_loaded(model_id: str) -> None:
     if _loaded_model_id == model_id and _model is not None:
         return
 
-    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from transformers import AutoModelForImageTextToText, AutoProcessor
 
     _device = _pick_device()
     dtype = _pick_dtype(_device)
@@ -86,7 +88,7 @@ def _ensure_loaded(model_id: str) -> None:
     t0 = time.monotonic()
 
     _processor = AutoProcessor.from_pretrained(model_id)
-    _model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    _model = AutoModelForImageTextToText.from_pretrained(
         model_id,
         torch_dtype=dtype,
         device_map=_device,
