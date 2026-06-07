@@ -21,6 +21,8 @@ import typer
 from rich.console import Console
 from rich.json import JSON
 from rich.logging import RichHandler
+from rich.live import Live
+from rich.panel import Panel
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -30,6 +32,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 from rich.table import Table
+from rich.text import Text
 
 from .analyze import (
     AnalyzeEvent,
@@ -221,7 +224,7 @@ def analyze_cmd(
             folder, prompt_filter=prompt, sort=sort_mode, fmt_eta=fmt_eta,
         )
     else:
-        stats = _run_analyze_rich(
+        stats = _run_analyze_visual(
             folder, prompt_filter=prompt, sort=sort_mode,
             n_todo=n_todo, fmt_eta=fmt_eta,
         )
@@ -268,7 +271,34 @@ def _log_event(ev: AnalyzeEvent, eta: str) -> None:
     print(" ".join(parts), file=sys.stderr, flush=True)
 
 
-def _run_analyze_rich(
+def _coerce_tags(output: Any) -> list[str]:
+    """Pull a flat list of tag-like strings out of a pass output.
+
+    Tag passes return lists. JSON passes return dicts whose values
+    can be lists. Text passes return strings — we don't extract tags
+    from those.
+    """
+    if isinstance(output, list):
+        return [str(t).strip() for t in output if isinstance(t, str) and t.strip()]
+    if isinstance(output, dict):
+        tags: list[str] = []
+        for v in output.values():
+            if isinstance(v, list):
+                for t in v:
+                    if isinstance(t, str) and t.strip():
+                        tags.append(t.strip())
+        return tags
+    return []
+
+
+# Cycling palette for the tag stream — high-contrast, terminal-safe.
+_TAG_PALETTE = (
+    "cyan", "magenta", "yellow", "green", "blue",
+    "bright_cyan", "bright_magenta", "bright_yellow", "bright_green",
+)
+
+
+def _run_analyze_visual(
     folder: Path,
     *,
     prompt_filter: list[str] | None,
@@ -276,48 +306,101 @@ def _run_analyze_rich(
     n_todo: int,
     fmt_eta: Any,
 ) -> AnalyzeStats:
+    """Streaming tag-wall view.
+
+    Layout (top → bottom):
+      • header panel:  current file, pass, elapsed, ETA, N/M
+      • burst row:     tags from the most-recent analyzed event
+      • cloud panel:   running tag counts as horizontal bars (top 20)
+    """
     progress = Progress(
         SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
+        TextColumn("[bold]{task.description}[/bold]"),
+        BarColumn(bar_width=None),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
-        TextColumn("eta {task.fields[eta]}"),
-        TextColumn("{task.fields[status]}"),
+        TextColumn("eta [cyan]{task.fields[eta]}[/cyan]"),
         console=console,
         transient=False,
         expand=True,
     )
-    with progress:
-        task_id = progress.add_task(
-            "analyzing", total=n_todo, status="", eta="—",
+    task_id = progress.add_task("analyzing", total=n_todo, eta="—")
+
+    counts: Counter[str] = Counter()
+    latest_file: str = "…"
+    latest_label: str = ""
+    latest_tags: list[str] = []
+    latest_elapsed: float = 0.0
+    burst_n: int = 0          # counter for palette cycling per event
+
+    def render_burst() -> Text:
+        if not latest_tags:
+            return Text("  waiting for first tags…", style="dim")
+        t = Text()
+        t.append(f"  {latest_file}", style="bold white")
+        t.append(f"  [{latest_label}]  ", style="dim")
+        t.append(f"{latest_elapsed:.1f}s\n", style="dim")
+        t.append("  ↳ ", style="dim")
+        for i, tag in enumerate(latest_tags[:20]):
+            color = _TAG_PALETTE[(burst_n + i) % len(_TAG_PALETTE)]
+            t.append(tag, style=color)
+            if i < min(len(latest_tags), 20) - 1:
+                t.append("  ")
+        if len(latest_tags) > 20:
+            t.append(f"  …+{len(latest_tags) - 20}", style="dim")
+        return t
+
+    def render_cloud() -> Text:
+        if not counts:
+            return Text("  (no tags yet)", style="dim")
+        top = counts.most_common(20)
+        max_n = top[0][1]
+        max_label = max(len(tag) for tag, _ in top)
+        bar_width = 32
+        t = Text()
+        for tag, n in top:
+            filled = max(1, round(bar_width * n / max_n))
+            color = _TAG_PALETTE[hash(tag) % len(_TAG_PALETTE)]
+            t.append(f"  {tag:<{max_label}}  ", style=color)
+            t.append("█" * filled, style=color)
+            t.append("·" * (bar_width - filled), style="dim")
+            t.append(f"  {n}\n", style="bold")
+        unique = len(counts)
+        total = sum(counts.values())
+        t.append(f"\n  {unique} unique tags  ·  {total} total mentions",
+                 style="dim italic")
+        return t
+
+    def render() -> Any:
+        from rich.console import Group
+        return Group(
+            progress,
+            Panel(render_burst(), title="latest", border_style="dim",
+                  padding=(0, 1)),
+            Panel(render_cloud(), title="tag cloud", border_style="dim",
+                  padding=(0, 1)),
         )
 
+    with Live(render(), console=console, refresh_per_second=8,
+              transient=False) as live:
+
         def on_event(ev: AnalyzeEvent, s: AnalyzeStats) -> None:
+            nonlocal latest_file, latest_label, latest_tags
+            nonlocal latest_elapsed, burst_n
             eta = fmt_eta(s, ev)
-            label = _prompt_label(ev.prompt, 30)
+            if ev.status != "skipped":
+                progress.advance(task_id)
+            progress.update(task_id, eta=eta)
             if ev.status == "analyzed":
-                progress.advance(task_id)
-                status = (
-                    f"[dim]{ev.video.name}[/dim] "
-                    f"[cyan]{label}[/cyan] "
-                    f"[green]ok[/green] "
-                    f"[dim]{ev.elapsed:.1f}s[/dim]"
-                )
-            elif ev.status == "skipped":
-                status = (
-                    f"[dim]{ev.video.name}[/dim] "
-                    f"[cyan]{label}[/cyan] "
-                    f"[dim]skip[/dim]"
-                )
-            else:
-                progress.advance(task_id)
-                status = (
-                    f"[dim]{ev.video.name}[/dim] "
-                    f"[cyan]{label}[/cyan] "
-                    f"[red]err[/red] {ev.detail[:60]}"
-                )
-            progress.update(task_id, status=status, eta=eta)
+                tags = _coerce_tags(ev.output)
+                if tags:
+                    latest_file = ev.video.name
+                    latest_label = _prompt_label(ev.prompt, 30)
+                    latest_tags = tags
+                    latest_elapsed = ev.elapsed
+                    burst_n += 1
+                    counts.update(tags)
+            live.update(render())
             _log_event(ev, eta)
 
         return run_analyze(

@@ -29,12 +29,15 @@ class AnalyzeEvent:
 
     *elapsed* is wall-clock seconds the pass took. For skipped / error
     events it's the time spent in the should_analyze check (≈ 0).
+    *output* carries the pass output for "analyzed" events so the
+    caller can render it live (None for skipped/error).
     """
     video: Path
     prompt: str
     status: str          # "analyzed" | "skipped" | "error"
     elapsed: float = 0.0
     detail: str = ""     # error message, when status == "error"
+    output: object = None
 
 
 @dataclass
@@ -205,7 +208,7 @@ def iter_analyze(
             update_sidecar(video, result, mapping=mapping)
             yield AnalyzeEvent(
                 video=video, prompt=p.prompt, status="analyzed",
-                elapsed=elapsed,
+                elapsed=elapsed, output=output,
             )
 
 
