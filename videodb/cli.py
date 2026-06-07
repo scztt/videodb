@@ -536,6 +536,16 @@ def cloud_cmd(
             help="Plain ASCII output (default uses colour).",
         ),
     ] = False,
+    lines: Annotated[
+        int | None,
+        typer.Option(
+            "--lines",
+            help=(
+                "Total rows to render (overrides terminal-height auto-fit). "
+                "Use this to scroll past the head/tail split, e.g. --lines 500."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Render a deterministic tag-frequency bar chart across sidecars.
 
@@ -574,7 +584,7 @@ def cloud_cmd(
     # Fill vertical space. Reserve: 1 title + 1 blank + (1 blank
     # above separator + 1 separator + 1 blank below when we have a
     # tail) = 5 rows. Otherwise 2 rows.
-    total_rows = max(6, term.lines - 1)
+    total_rows = max(6, lines if lines is not None else term.lines - 1)
 
     # Allocate row budget. Tail rows are packed with multiple tags
     # per row, so we don't need many. Head rows are 1 bar per row.
