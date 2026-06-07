@@ -12,7 +12,8 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from collections import Counter
+import time
+from collections import Counter, deque
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any
@@ -160,6 +161,17 @@ def analyze_cmd(
             help="Suppress the live progress bar (still logs to stderr).",
         ),
     ] = False,
+    window: Annotated[
+        int,
+        typer.Option(
+            "--window",
+            help=(
+                "Cloud counts only the last N tag-producing events "
+                "(rolling window). Keeps the cloud reactive on long "
+                "runs instead of asymptoting to averages. 0 = unlimited."
+            ),
+        ),
+    ] = 100,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
     """Run analysis passes, writing/updating sidecars.
@@ -226,7 +238,7 @@ def analyze_cmd(
     else:
         stats = _run_analyze_visual(
             folder, prompt_filter=prompt, sort=sort_mode,
-            n_todo=n_todo, fmt_eta=fmt_eta,
+            n_todo=n_todo, fmt_eta=fmt_eta, window=window,
         )
 
     table = Table(show_header=False, box=None, padding=(0, 2))
@@ -305,13 +317,17 @@ def _run_analyze_visual(
     sort: str | None,
     n_todo: int,
     fmt_eta: Any,
+    window: int = 100,
 ) -> AnalyzeStats:
     """Streaming tag-wall view.
 
     Layout (top → bottom):
       • header panel:  current file, pass, elapsed, ETA, N/M
       • burst row:     tags from the most-recent analyzed event
-      • cloud panel:   running tag counts as horizontal bars (top 20)
+      • cloud panel:   tag counts as horizontal bars (top 20)
+
+    *window*: rolling window of the last N tag-producing events.
+    Keeps the cloud reactive. 0 = unlimited (lifetime counts).
     """
     progress = Progress(
         SpinnerColumn(),
@@ -326,16 +342,25 @@ def _run_analyze_visual(
     )
     task_id = progress.add_task("analyzing", total=n_todo, eta="—")
 
-    counts: Counter[str] = Counter()
+    # Rolling window of per-event tag lists. window=0 means unbounded.
+    tag_events: deque[list[str]] = deque(maxlen=window if window > 0 else None)
+    lifetime_total: int = 0   # total mentions ever, for the footer
+
     latest_file: str = "…"
     latest_label: str = ""
     latest_tags: list[str] = []
     latest_elapsed: float = 0.0
     burst_n: int = 0          # counter for palette cycling per event
+    t_start = time.monotonic()
 
     def render_burst() -> Text:
         if not latest_tags:
-            return Text("  waiting for first tags…", style="dim")
+            waited = time.monotonic() - t_start
+            return Text(
+                f"  warming up — loading model / decoding first video "
+                f"({waited:.0f}s elapsed)",
+                style="dim italic",
+            )
         t = Text()
         t.append(f"  {latest_file}", style="bold white")
         t.append(f"  [{latest_label}]  ", style="dim")
@@ -351,6 +376,11 @@ def _run_analyze_visual(
         return t
 
     def render_cloud() -> Text:
+        if not tag_events:
+            return Text("  (no tags yet)", style="dim")
+        counts: Counter[str] = Counter()
+        for tags in tag_events:
+            counts.update(tags)
         if not counts:
             return Text("  (no tags yet)", style="dim")
         top = counts.most_common(20)
@@ -366,9 +396,16 @@ def _run_analyze_visual(
             t.append("·" * (bar_width - filled), style="dim")
             t.append(f"  {n}\n", style="bold")
         unique = len(counts)
-        total = sum(counts.values())
-        t.append(f"\n  {unique} unique tags  ·  {total} total mentions",
-                 style="dim italic")
+        window_total = sum(counts.values())
+        win_label = (
+            f"window of {len(tag_events)}/{window}"
+            if window > 0 else f"all {len(tag_events)} events"
+        )
+        t.append(
+            f"\n  {unique} unique  ·  {window_total} in {win_label}"
+            f"  ·  {lifetime_total} lifetime",
+            style="dim italic",
+        )
         return t
 
     def render() -> Any:
@@ -386,7 +423,7 @@ def _run_analyze_visual(
 
         def on_event(ev: AnalyzeEvent, s: AnalyzeStats) -> None:
             nonlocal latest_file, latest_label, latest_tags
-            nonlocal latest_elapsed, burst_n
+            nonlocal latest_elapsed, burst_n, lifetime_total
             eta = fmt_eta(s, ev)
             if ev.status != "skipped":
                 progress.advance(task_id)
@@ -399,7 +436,8 @@ def _run_analyze_visual(
                     latest_tags = tags
                     latest_elapsed = ev.elapsed
                     burst_n += 1
-                    counts.update(tags)
+                    tag_events.append(tags)
+                    lifetime_total += len(tags)
             live.update(render())
             _log_event(ev, eta)
 
