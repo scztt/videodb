@@ -722,9 +722,10 @@ def _collect_tag_counts(
     matched = 0
     for sc in root.rglob("*.videodb.json"):
         try:
-            with open(sc) as f:
+            with open(sc, encoding="utf-8") as f:
                 data = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            err_console.print(f"[yellow]skipping unreadable sidecar {sc}: {e}[/yellow]")
             continue
         for key, entry in (data.get("analyses") or {}).items():
             if needle not in key.lower():
