@@ -1069,6 +1069,149 @@ def _render_separator(
 
 
 # ---------------------------------------------------------------------------
+# find — list videos whose tags include every given tag (AND)
+# ---------------------------------------------------------------------------
+
+
+def _all_tags_for_sidecar(data: dict[str, Any], prompt_substr: str | None) -> set[str]:
+    """Collect every tag string from a sidecar's analyses.
+
+    If *prompt_substr* is given, restrict to entries whose key contains
+    it (case-insensitive). String outputs are ignored.
+    """
+    needle = prompt_substr.lower() if prompt_substr else None
+    tags: set[str] = set()
+    for key, entry in (data.get("analyses") or {}).items():
+        if needle is not None and needle not in key.lower():
+            continue
+        out = entry.get("output")
+        if isinstance(out, list):
+            for t in out:
+                if isinstance(t, str) and t.strip():
+                    tags.add(t.strip())
+        elif isinstance(out, dict):
+            for v in out.values():
+                if isinstance(v, list):
+                    for t in v:
+                        if isinstance(t, str) and t.strip():
+                            tags.add(t.strip())
+    return tags
+
+
+def _video_for_sidecar(sc: Path) -> Path:
+    """Strip the `.videodb.json` suffix to get the video path."""
+    # Default mapping is "{fullpath}.videodb.json" — chop the suffix.
+    name = sc.name
+    if name.endswith(".videodb.json"):
+        return sc.with_name(name[: -len(".videodb.json")])
+    return sc  # unexpected, but don't crash
+
+
+@app.command("find")
+def find_cmd(
+    tags: Annotated[
+        list[str],
+        typer.Argument(
+            help=(
+                "One or more tags. Videos must have ALL of them "
+                "(case-insensitive match against stored tags)."
+            ),
+        ),
+    ],
+    path: Annotated[
+        Path,
+        typer.Option(
+            "--path", "-p",
+            help="Folder to scan for sidecars (recursive).",
+        ),
+    ] = Path("."),
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            help=(
+                "Only consider tags from analyses whose prompt key "
+                "contains this substring (case-insensitive). Default: "
+                "any tag-producing pass counts."
+            ),
+        ),
+    ] = None,
+    no_duration: Annotated[
+        bool,
+        typer.Option(
+            "--no-duration",
+            help="Skip the duration probe (faster; just paths + tags).",
+        ),
+    ] = False,
+) -> None:
+    """Find videos tagged with ALL the given tags (AND).
+
+    Prints one match per video as two lines:
+        <video path>  <duration>
+          <space-separated tags>
+    """
+    wanted = {t.strip().lower() for t in tags if t.strip()}
+    if not wanted:
+        err_console.print("[red]No tags given.[/red]")
+        raise typer.Exit(2)
+
+    # Lazy: torchcodec is expensive to import on cold start.
+    from collections.abc import Callable
+    probe: Callable[[Path], float | None] | None = None
+    if not no_duration:
+        try:
+            from torchcodec.decoders import VideoDecoder  # type: ignore
+
+            def _probe(p: Path) -> float | None:
+                try:
+                    return float(VideoDecoder(str(p)).metadata.duration_seconds or 0.0)
+                except Exception:  # noqa: BLE001
+                    return None
+
+            probe = _probe
+        except ImportError:
+            probe = None
+
+    matches: list[tuple[Path, set[str]]] = []
+    for sc in path.rglob("*.videodb.json"):
+        try:
+            with open(sc, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            err_console.print(f"[yellow]skipping unreadable sidecar {sc}: {e}[/yellow]")
+            continue
+        all_tags = _all_tags_for_sidecar(data, prompt)
+        lower_index = {t.lower(): t for t in all_tags}
+        if wanted.issubset(lower_index.keys()):
+            matches.append((_video_for_sidecar(sc), all_tags))
+
+    if not matches:
+        err_console.print(
+            f"[yellow]No videos under {path} matched all tags: "
+            f"{', '.join(sorted(wanted))}[/yellow]"
+        )
+        raise typer.Exit(1)
+
+    matches.sort(key=lambda m: str(m[0]))
+    for video, all_tags in matches:
+        dur_str = ""
+        if probe is not None:
+            d = probe(video)
+            if d is not None:
+                dur_str = f"  [dim]{_fmt_duration(d)}[/dim]"
+        console.print(f"[bold]{video}[/bold]{dur_str}")
+        sorted_tags = sorted(all_tags, key=str.lower)
+        # Highlight matched tags; dim the rest.
+        rendered: list[str] = []
+        for t in sorted_tags:
+            if t.lower() in wanted:
+                rendered.append(f"[green]{t}[/green]")
+            else:
+                rendered.append(f"[dim]{t}[/dim]")
+        console.print("  " + "  ".join(rendered))
+
+
+# ---------------------------------------------------------------------------
 # passes — list which passes would run for a given path
 # ---------------------------------------------------------------------------
 
