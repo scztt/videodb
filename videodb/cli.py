@@ -838,6 +838,18 @@ def _pack_tail(
     return rows_used, tags_shown
 
 
+def _iter_sidecars(root: Path):
+    """Walk *root* for `*.videodb.json` sidecars, skipping AppleDouble.
+
+    macOS writes `._<name>` resource-fork shadows on exfat/fat32 that
+    are not JSON and pollute every walk. Filter them here.
+    """
+    for sc in root.rglob("*.videodb.json"):
+        if sc.name.startswith("._"):
+            continue
+        yield sc
+
+
 def _collect_tag_counts(
     root: Path, prompt_substr: str,
 ) -> tuple["Counter[str]", int]:
@@ -851,7 +863,7 @@ def _collect_tag_counts(
     needle = prompt_substr.lower()
     counts: Counter[str] = Counter()
     matched = 0
-    for sc in root.rglob("*.videodb.json"):
+    for sc in _iter_sidecars(root):
         try:
             with open(sc, encoding="utf-8") as f:
                 data = json.load(f)
@@ -1173,7 +1185,7 @@ def find_cmd(
             probe = None
 
     matches: list[tuple[Path, set[str]]] = []
-    for sc in path.rglob("*.videodb.json"):
+    for sc in _iter_sidecars(path):
         try:
             with open(sc, encoding="utf-8") as f:
                 data = json.load(f)
