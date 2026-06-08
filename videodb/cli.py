@@ -624,12 +624,16 @@ def cloud_cmd(
         typer.Argument(help="Folder to scan for sidecars (recursive)."),
     ] = Path("."),
     limit: Annotated[
-        int,
+        int | None,
         typer.Option(
             "--limit", "-n",
-            help="Max number of tags to render.",
+            help=(
+                "Max number of head tags to render. Defaults to the "
+                "head row budget — so `--lines 500` shows up to ~500 "
+                "head bars by itself, no separate cap needed."
+            ),
         ),
-    ] = 150,
+    ] = None,
     min_count: Annotated[
         int,
         typer.Option(
@@ -717,7 +721,10 @@ def cloud_cmd(
         head_rows = total_rows - 4 - tail_rows
 
     # Head: at most `limit` bars, also capped to `head_rows`.
-    head_n = min(limit, head_rows, len(ranked_all))
+    # When --limit is unset, the head row budget is the only cap, so
+    # bumping --lines N expands the bar count naturally.
+    cap = limit if limit is not None else head_rows
+    head_n = min(cap, head_rows, len(ranked_all))
     head = ranked_all[:head_n]
 
     # Tail: pack tags by count desc into `tail_rows` lines. The
