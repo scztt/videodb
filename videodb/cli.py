@@ -1155,17 +1155,80 @@ def find_cmd(
             help="Skip the duration probe (faster; just paths + tags).",
         ),
     ] = False,
+    vocabulary: Annotated[
+        Path | None,
+        typer.Option(
+            "--vocabulary",
+            help=(
+                "Path to vocabulary.json. Default: <path>/vocabulary.json "
+                "if present. Pass --no-vocabulary to disable."
+            ),
+        ),
+    ] = None,
+    no_vocabulary: Annotated[
+        bool,
+        typer.Option(
+            "--no-vocabulary",
+            help="Ignore any vocabulary.json — match raw stored tags.",
+        ),
+    ] = False,
 ) -> None:
     """Find videos tagged with ALL the given tags (AND).
+
+    If a vocabulary.json is present (from `vocab-prune --apply`), tags
+    are normalized through it: query tags map to their canonical form,
+    and stored tags do too, so e.g. `find car` also matches videos
+    tagged only with `cars`.
 
     Prints one match per video as two lines:
         <video path>  <duration>
           <space-separated tags>
     """
-    wanted = {t.strip().lower() for t in tags if t.strip()}
-    if not wanted:
+    # Resolve vocabulary: explicit --vocabulary > default at scan root.
+    vocab_data: dict[str, Any] | None = None
+    if not no_vocabulary:
+        vocab_path = vocabulary or _default_vocab_path(path)
+        vocab_data = _load_vocabulary(vocab_path)
+        if vocab_data is not None:
+            err_console.print(
+                f"[dim]using vocabulary {vocab_path} "
+                f"({vocab_data.get('stats', {}).get('unique_tags_kept', '?')} "
+                f"canonicals)[/dim]"
+            )
+
+    # merges: {variant_lowercase: canonical_lowercase}
+    merges_lower: dict[str, str] = {}
+    kept_canonicals: set[str] = set()
+    if vocab_data is not None:
+        for variant, canonical in vocab_data.get("merges", {}).items():
+            merges_lower[variant.lower()] = canonical.lower()
+        for canonical in vocab_data.get("vocabulary", {}):
+            kept_canonicals.add(canonical.lower())
+
+    def normalize(tag: str) -> str | None:
+        """Return canonical form of *tag*, or None if it's dropped.
+
+        Without a vocabulary, returns the tag lowercased unchanged.
+        """
+        low = tag.lower()
+        if vocab_data is None:
+            return low
+        canon = merges_lower.get(low, low)
+        if canon in kept_canonicals:
+            return canon
+        return None  # dropped from vocab
+
+    # Normalize the user's query tags through the vocabulary. A query
+    # tag that's not in vocab (None) still gets matched literally —
+    # users can ask for sub-cutoff or dropped tags by name.
+    raw_wanted = [t.strip() for t in tags if t.strip()]
+    if not raw_wanted:
         err_console.print("[red]No tags given.[/red]")
         raise typer.Exit(2)
+    wanted: set[str] = set()
+    for t in raw_wanted:
+        norm = normalize(t)
+        wanted.add(norm if norm is not None else t.lower())
 
     # Lazy: torchcodec is expensive to import on cold start.
     from collections.abc import Callable
@@ -1193,8 +1256,15 @@ def find_cmd(
             err_console.print(f"[yellow]skipping unreadable sidecar {sc}: {e}[/yellow]")
             continue
         all_tags = _all_tags_for_sidecar(data, prompt)
-        lower_index = {t.lower(): t for t in all_tags}
-        if wanted.issubset(lower_index.keys()):
+        # Build the normalized index for matching. Each stored tag
+        # either maps to its canonical (if in vocab) or to its own
+        # lowercased form (no-vocab path, or sub-cutoff fallback for
+        # query-by-raw-name to still work).
+        index: set[str] = set()
+        for t in all_tags:
+            norm = normalize(t)
+            index.add(norm if norm is not None else t.lower())
+        if wanted.issubset(index):
             matches.append((_video_for_sidecar(sc), all_tags))
 
     if not matches:
@@ -1213,10 +1283,12 @@ def find_cmd(
                 dur_str = f"  [dim]{_fmt_duration(d)}[/dim]"
         console.print(f"[bold]{video}[/bold]{dur_str}")
         sorted_tags = sorted(all_tags, key=str.lower)
-        # Highlight matched tags; dim the rest.
+        # Highlight matched tags (after vocab normalization); dim the rest.
         rendered: list[str] = []
         for t in sorted_tags:
-            if t.lower() in wanted:
+            norm = normalize(t)
+            effective = norm if norm is not None else t.lower()
+            if effective in wanted:
                 rendered.append(f"[green]{t}[/green]")
             else:
                 rendered.append(f"[dim]{t}[/dim]")
@@ -1226,6 +1298,71 @@ def find_cmd(
 # ---------------------------------------------------------------------------
 # vocab — tag vocabulary stats (find the long tail, plan a cutoff)
 # ---------------------------------------------------------------------------
+
+
+def _scan_doc_frequency(
+    path: Path, prompt: str | None,
+) -> tuple[Counter[str], int, int]:
+    """Walk *path* and return (df counter, n_sidecars, n_with_tags).
+
+    df[tag] = number of videos in which the tag appears (set per
+    sidecar — duplicate within-video tags don't inflate the count).
+    """
+    df: Counter[str] = Counter()
+    n_sidecars = 0
+    n_with_tags = 0
+    for sc in _iter_sidecars(path):
+        try:
+            with open(sc, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            err_console.print(
+                f"[yellow]skipping unreadable sidecar {sc}: {e}[/yellow]"
+            )
+            continue
+        n_sidecars += 1
+        tags = _all_tags_for_sidecar(data, prompt)
+        if tags:
+            n_with_tags += 1
+            df.update(tags)
+    return df, n_sidecars, n_with_tags
+
+
+def _dedup_key(tag: str) -> str:
+    """Cheap canonicalization key: casefold + collapse whitespace +
+    strip a trailing 's' (length > 3) for naive plural collapse."""
+    key = tag.casefold().strip()
+    key = " ".join(key.split())
+    if key.endswith("s") and len(key) > 3:
+        key = key[:-1]
+    return key
+
+
+def _build_merges(
+    df: Counter[str], kept: set[str],
+) -> dict[str, str]:
+    """Return {variant: canonical} where canonical is the highest-df
+    member of each casefold/plural collision group.
+
+    Only entries from *kept* are considered as canonicals. Variants
+    map to a canonical regardless of whether they themselves are kept
+    (so a dropped variant still resolves to its kept canonical).
+    """
+    groups: dict[str, list[str]] = {}
+    for tag in df:
+        groups.setdefault(_dedup_key(tag), []).append(tag)
+    merges: dict[str, str] = {}
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        # Canonical = highest-df member that is in `kept`, else the
+        # highest-df member overall.
+        members.sort(key=lambda t: (-df[t], t))
+        canonical = next((t for t in members if t in kept), members[0])
+        for t in members:
+            if t != canonical:
+                merges[t] = canonical
+    return merges
 
 
 @app.command("vocab")
@@ -1276,23 +1413,7 @@ def vocab_cmd(
     tail starts; the cutoff table tells you how aggressive you can
     be without losing much vocabulary coverage.
     """
-    # df[tag] = number of videos that include the tag (set per sidecar
-    # de-dups within-video duplicates from JSON-shaped outputs).
-    df: Counter[str] = Counter()
-    n_sidecars = 0
-    n_with_tags = 0
-    for sc in _iter_sidecars(path):
-        try:
-            with open(sc, encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
-            err_console.print(f"[yellow]skipping unreadable sidecar {sc}: {e}[/yellow]")
-            continue
-        n_sidecars += 1
-        tags = _all_tags_for_sidecar(data, prompt)
-        if tags:
-            n_with_tags += 1
-            df.update(tags)
+    df, n_sidecars, n_with_tags = _scan_doc_frequency(path, prompt)
 
     if not df:
         err_console.print(
@@ -1398,6 +1519,219 @@ def vocab_cmd(
                     f"[dim]{t}({df[t]})[/dim]" for t in g[1:]
                 ]
                 console.print("  " + "  ·  ".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# vocab-prune — produce a vocabulary.json: kept tags + merges
+# ---------------------------------------------------------------------------
+
+
+# Default path for the controlled-vocabulary file. Lives alongside
+# the scanned folder so per-archive vocabularies don't collide.
+def _default_vocab_path(scan_root: Path) -> Path:
+    return scan_root / "vocabulary.json"
+
+
+def _load_vocabulary(p: Path) -> dict[str, Any] | None:
+    """Return the parsed vocabulary.json at *p*, or None if missing.
+
+    Errors are reported and treated as missing — `find` etc. should
+    degrade gracefully when the file is broken.
+    """
+    if not p.exists():
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        err_console.print(
+            f"[yellow]ignoring unreadable vocabulary at {p}: {e}[/yellow]"
+        )
+        return None
+
+
+@app.command("vocab-prune")
+def vocab_prune_cmd(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Folder to scan for sidecars (recursive)."),
+    ] = Path("."),
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            help=(
+                "Only consider tags from analyses whose prompt key "
+                "contains this substring (case-insensitive)."
+            ),
+        ),
+    ] = None,
+    min_df: Annotated[
+        int,
+        typer.Option(
+            "--min-df",
+            help=(
+                "Minimum document frequency to keep a tag (number of "
+                "videos it must appear in). See `videodb vocab` for "
+                "the cutoff table."
+            ),
+        ),
+    ] = 5,
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help=(
+                "Actually write vocabulary.json. Without this flag "
+                "the command is a dry-run preview."
+            ),
+        ),
+    ] = False,
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            help=(
+                "Where to write vocabulary.json (default: "
+                "<path>/vocabulary.json)."
+            ),
+        ),
+    ] = None,
+    examples: Annotated[
+        int,
+        typer.Option(
+            "--examples",
+            help="Sample N dropped tags + N merges to show in the preview.",
+        ),
+    ] = 15,
+) -> None:
+    """Emit a vocabulary.json: kept tags + casefold/plural merges.
+
+    The vocabulary file is the source of truth — sidecars stay
+    untouched. `find` (and downstream agents) will load it and
+    rewrite tags through the merges at query time.
+    """
+    df, n_sidecars, n_with_tags = _scan_doc_frequency(path, prompt)
+    if not df:
+        err_console.print(
+            f"[yellow]No tags found under {path}"
+            + (f" for prompt~{prompt!r}" if prompt else "")
+            + "[/yellow]"
+        )
+        raise typer.Exit(1)
+
+    V = len(df)
+    total_mentions = sum(df.values())
+
+    kept = {t for t, c in df.items() if c >= min_df}
+    merges = _build_merges(df, kept)
+    # A merged variant resolves to a kept canonical → effectively kept
+    # (its mentions get re-attributed). Treat as such for reporting.
+    effectively_kept = kept | {v for v in merges if merges[v] in kept}
+    dropped = {t for t in df if t not in effectively_kept}
+
+    kept_mentions = sum(df[t] for t in effectively_kept)
+    dropped_mentions = total_mentions - kept_mentions
+
+    mode = "[bold green]APPLY[/bold green]" if apply else "[bold yellow]dry-run[/bold yellow]"
+    console.print(
+        f"\n{mode} — scanned {n_with_tags}/{n_sidecars} videos, "
+        f"{V:,} unique tags, {total_mentions:,} mentions\n"
+    )
+
+    summary = Table(show_header=False, box=None, padding=(0, 2))
+    summary.add_row(
+        "[green]kept[/green]",
+        f"{len(kept):,} tags  ·  {100 * len(kept) / V:.1f}% of vocab",
+    )
+    summary.add_row(
+        "[cyan]merges[/cyan]",
+        f"{len(merges):,} variants → canonical",
+    )
+    summary.add_row(
+        "[red]dropped[/red]",
+        f"{len(dropped):,} tags  ·  "
+        f"{100 * len(dropped) / V:.1f}% of vocab  ·  "
+        f"{100 * dropped_mentions / total_mentions:.1f}% of mentions",
+    )
+    summary.add_row(
+        "coverage",
+        f"{100 * kept_mentions / total_mentions:.1f}% of mentions retained",
+    )
+    console.print(summary)
+
+    if examples > 0:
+        # Sample merges by descending canonical df — most impactful first.
+        sorted_merges = sorted(
+            merges.items(),
+            key=lambda kv: -df[kv[1]],
+        )[:examples]
+        if sorted_merges:
+            console.print("\n[bold]sample merges[/bold]")
+            for variant, canonical in sorted_merges:
+                console.print(
+                    f"  [dim]{variant}[/dim]({df[variant]}) → "
+                    f"[bold]{canonical}[/bold]({df[canonical]})"
+                )
+        # Sample dropped tags — sorted by df descending so you see what
+        # you're losing nearest the cutoff first.
+        sorted_dropped = sorted(
+            dropped, key=lambda t: (-df[t], t),
+        )[:examples]
+        if sorted_dropped:
+            console.print(
+                "\n[bold]sample dropped tags[/bold] "
+                "[dim](closest to the cutoff)[/dim]"
+            )
+            console.print(
+                "  " + "  ·  ".join(
+                    f"[dim]{t}[/dim]({df[t]})" for t in sorted_dropped
+                )
+            )
+
+    if not apply:
+        console.print(
+            "\n[dim]dry-run — pass [bold]--apply[/bold] to write "
+            "vocabulary.json[/dim]"
+        )
+        return
+
+    out_path = out or _default_vocab_path(path)
+    payload = {
+        "version": 1,
+        "scan_root": str(path.resolve()),
+        "prompt_filter": prompt,
+        "min_df": min_df,
+        "n_videos_scanned": n_sidecars,
+        "n_videos_with_tags": n_with_tags,
+        "stats": {
+            "unique_tags_before": V,
+            "unique_tags_kept": len(kept),
+            "merges": len(merges),
+            "dropped": len(dropped),
+            "total_mentions": total_mentions,
+            "mentions_retained": kept_mentions,
+        },
+        # Canonical → list of all members (canonical first, then variants
+        # by df desc). This is what `find` will read.
+        "vocabulary": {
+            canon: [canon] + [
+                v for v, _ in sorted(
+                    ((v, df[v]) for v, c2 in merges.items() if c2 == canon),
+                    key=lambda x: (-x[1], x[0]),
+                )
+            ]
+            for canon in sorted(kept, key=lambda t: (-df[t], t))
+        },
+        # Flat {variant: canonical} for cheap lookup.
+        "merges": merges,
+        # Tags scanned but neither kept nor merged into a kept canonical.
+        "dropped": sorted(dropped),
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    console.print(f"\n[green]wrote[/green] {out_path}")
 
 
 # ---------------------------------------------------------------------------
