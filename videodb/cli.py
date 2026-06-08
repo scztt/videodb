@@ -1224,6 +1224,183 @@ def find_cmd(
 
 
 # ---------------------------------------------------------------------------
+# vocab — tag vocabulary stats (find the long tail, plan a cutoff)
+# ---------------------------------------------------------------------------
+
+
+@app.command("vocab")
+def vocab_cmd(
+    path: Annotated[
+        Path,
+        typer.Argument(help="Folder to scan for sidecars (recursive)."),
+    ] = Path("."),
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt",
+            help=(
+                "Only consider tags from analyses whose prompt key "
+                "contains this substring (case-insensitive)."
+            ),
+        ),
+    ] = None,
+    top: Annotated[
+        int,
+        typer.Option(
+            "--top",
+            help="Show top-N most common tags (set 0 to hide).",
+        ),
+    ] = 30,
+    bottom: Annotated[
+        int,
+        typer.Option(
+            "--bottom",
+            help="Show N sample tags from the long tail (set 0 to hide).",
+        ),
+    ] = 20,
+    near_dupes: Annotated[
+        int,
+        typer.Option(
+            "--near-dupes",
+            help=(
+                "Show N example casefold/whitespace/plural collisions "
+                "— cheap deduplication targets. Set 0 to hide."
+            ),
+        ),
+    ] = 15,
+) -> None:
+    """Tag vocabulary statistics — pick a cutoff before pruning.
+
+    Document frequency (how many videos use each tag) is the lever
+    most worth looking at. The histogram tells you where the long
+    tail starts; the cutoff table tells you how aggressive you can
+    be without losing much vocabulary coverage.
+    """
+    # df[tag] = number of videos that include the tag (set per sidecar
+    # de-dups within-video duplicates from JSON-shaped outputs).
+    df: Counter[str] = Counter()
+    n_sidecars = 0
+    n_with_tags = 0
+    for sc in _iter_sidecars(path):
+        try:
+            with open(sc, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            err_console.print(f"[yellow]skipping unreadable sidecar {sc}: {e}[/yellow]")
+            continue
+        n_sidecars += 1
+        tags = _all_tags_for_sidecar(data, prompt)
+        if tags:
+            n_with_tags += 1
+            df.update(tags)
+
+    if not df:
+        err_console.print(
+            f"[yellow]No tags found under {path}"
+            + (f" for prompt~{prompt!r}" if prompt else "")
+            + "[/yellow]"
+        )
+        raise typer.Exit(1)
+
+    V = len(df)
+    total_mentions = sum(df.values())
+
+    # Frequency histogram by document frequency thresholds. Each row
+    # is "tags appearing in ≥k videos" — picking a cutoff means
+    # "trim the rest". Coverage = fraction of total mentions retained.
+    cutoffs = [1, 2, 3, 5, 10, 25, 50, 100, 250, 500, 1000]
+    cutoffs = [k for k in cutoffs if k <= max(df.values())]
+
+    console.print(
+        f"\n[bold]vocabulary scanned[/bold] — {V:,} unique tags  ·  "
+        f"{total_mentions:,} mentions  ·  "
+        f"{n_with_tags}/{n_sidecars} videos contributed\n"
+    )
+
+    cutoff_table = Table(title="cutoff table", show_lines=False, box=None)
+    cutoff_table.add_column("min videos (df ≥ k)", justify="right", style="bold")
+    cutoff_table.add_column("tags kept", justify="right")
+    cutoff_table.add_column("% vocab", justify="right")
+    cutoff_table.add_column("mention coverage", justify="right")
+    for k in cutoffs:
+        kept = [t for t, c in df.items() if c >= k]
+        n_kept = len(kept)
+        m_kept = sum(df[t] for t in kept)
+        cutoff_table.add_row(
+            str(k),
+            f"{n_kept:,}",
+            f"{100 * n_kept / V:.1f}%",
+            f"{100 * m_kept / total_mentions:.1f}%",
+        )
+    console.print(cutoff_table)
+
+    # Singletons & near-singletons — the long tail in absolute terms.
+    n_singleton = sum(1 for c in df.values() if c == 1)
+    n_le_2 = sum(1 for c in df.values() if c <= 2)
+    n_le_5 = sum(1 for c in df.values() if c <= 5)
+    console.print(
+        f"\n[dim]long tail:[/dim] "
+        f"{n_singleton:,} appear in just 1 video "
+        f"({100 * n_singleton / V:.0f}% of vocab), "
+        f"{n_le_2:,} in ≤2, "
+        f"{n_le_5:,} in ≤5."
+    )
+
+    # Top tags — the controlled-vocabulary candidates.
+    if top > 0:
+        top_tbl = Table(title=f"\ntop {top} tags by document frequency",
+                        show_lines=False, box=None)
+        top_tbl.add_column("tag", style="bold")
+        top_tbl.add_column("videos", justify="right")
+        for tag, c in df.most_common(top):
+            top_tbl.add_row(tag, f"{c:,}")
+        console.print(top_tbl)
+
+    # Long-tail sample — what would get pruned at low cutoffs.
+    if bottom > 0:
+        tail = [t for t, c in df.items() if c == 1]
+        sample = sorted(tail)[:bottom]
+        if sample:
+            console.print(
+                f"\n[dim]sample of {bottom} singletons "
+                f"(of {n_singleton:,}):[/dim]"
+            )
+            console.print("  " + "  ".join(f"[dim]{t}[/dim]" for t in sample))
+
+    # Cheap dedup targets: tags that collide under casefold +
+    # whitespace + simple plural strip. These are deterministic
+    # savings, no model required.
+    if near_dupes > 0:
+        groups: dict[str, list[str]] = {}
+        for tag in df:
+            key = tag.casefold().strip()
+            key = " ".join(key.split())
+            if key.endswith("s") and len(key) > 3:
+                key = key[:-1]
+            groups.setdefault(key, []).append(tag)
+        collisions = [
+            sorted(v, key=lambda t: (-df[t], t))
+            for v in groups.values() if len(v) > 1
+        ]
+        # Sort by total merged frequency — best savings first.
+        collisions.sort(key=lambda g: -sum(df[t] for t in g))
+        if collisions:
+            vocab_drop = sum(len(g) - 1 for g in collisions)
+            console.print(
+                f"\n[bold]cheap dedup candidates[/bold] — "
+                f"{len(collisions):,} groups, would shrink vocab by "
+                f"{vocab_drop:,} tags ({100 * vocab_drop / V:.1f}%) "
+                f"with no model required.\n"
+            )
+            shown = collisions[:near_dupes]
+            for g in shown:
+                parts = [f"[bold]{g[0]}[/bold]({df[g[0]]})"] + [
+                    f"[dim]{t}({df[t]})[/dim]" for t in g[1:]
+                ]
+                console.print("  " + "  ·  ".join(parts))
+
+
+# ---------------------------------------------------------------------------
 # passes — list which passes would run for a given path
 # ---------------------------------------------------------------------------
 
