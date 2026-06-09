@@ -1488,22 +1488,55 @@ def export_cmd(
     """Export every video and its tag list to a single CSV file.
 
     Two-pass walk: first computes document frequency across all
-    sidecars (respecting `--prompt`), then emits one row per video
-    with that video's tags filtered to `min_df ≤ df ≤ max_df`.
+    sidecars (respecting `--prompt`) AND folds together
+    casefold/whitespace/naive-plural variants (`Cars`/`cars`/`car`
+    become one canonical tag), then emits one row per video with
+    that video's tags filtered to `min_df ≤ df ≤ max_df`.
 
     Format: ``filename,tags`` — the tag column is a CSV-quoted
     comma-separated list, so tags can themselves contain commas.
     """
     import csv
 
-    df, _, _ = _scan_doc_frequency(path, prompt)
-    if not df:
+    raw_df, _, _ = _scan_doc_frequency(path, prompt)
+    if not raw_df:
         err_console.print(
             f"[yellow]No tags found under {path}"
             + (f" for prompt~{prompt!r}" if prompt else "")
             + "[/yellow]"
         )
         raise typer.Exit(1)
+
+    # --- dedup pass: group raw tags by a cheap canonicalization key
+    # (casefold + whitespace collapse + naive depluralize), then pick
+    # the highest-df member of each group as the canonical form.
+    def _key(tag: str) -> str:
+        k = " ".join(tag.casefold().strip().split())
+        if k.endswith("s") and len(k) > 3:
+            k = k[:-1]
+        return k
+
+    groups: dict[str, list[str]] = {}
+    for tag in raw_df:
+        groups.setdefault(_key(tag), []).append(tag)
+
+    # canonical_of[raw_tag] = canonical form to use in the CSV.
+    # df[canonical] = sum of df across all raw variants in the group.
+    canonical_of: dict[str, str] = {}
+    df: Counter[str] = Counter()
+    for members in groups.values():
+        members.sort(key=lambda t: (-raw_df[t], t))
+        canonical = members[0]
+        merged = sum(raw_df[m] for m in members)
+        df[canonical] = merged
+        for m in members:
+            canonical_of[m] = canonical
+
+    n_merges = len(raw_df) - len(df)
+    err_console.print(
+        f"[dim]dedup: {len(raw_df):,} raw tags → {len(df):,} canonicals "
+        f"({n_merges:,} variants merged)[/dim]"
+    )
 
     # Compute the kept tag set up-front so we don't recheck per video.
     upper = max_df if max_df is not None else 10**18
@@ -1514,7 +1547,7 @@ def export_cmd(
     )
 
     err_console.print(
-        f"[dim]vocab: {len(df):,} unique tags  ·  "
+        f"[dim]vocab: {len(df):,} canonical tags  ·  "
         f"keeping {len(kept):,} "
         f"(dropped {dropped_low:,} below --min={min_df}, "
         f"{dropped_high:,} above --max={max_df})[/dim]"
@@ -1537,11 +1570,15 @@ def export_cmd(
                 )
                 continue
             video = _video_for_sidecar(sc)
-            # Filter & deterministically order the tags.
-            row_tags = sorted(
-                (t for t in _all_tags_for_sidecar(data, prompt) if t in kept),
-                key=lambda t: (-df[t], t),
-            )
+            # Canonicalize, drop those outside the cutoffs, then dedupe
+            # within-row (two raw variants of the same canonical
+            # shouldn't appear twice on the same row).
+            row_canon: set[str] = set()
+            for t in _all_tags_for_sidecar(data, prompt):
+                c = canonical_of.get(t, t)
+                if c in kept:
+                    row_canon.add(c)
+            row_tags = sorted(row_canon, key=lambda t: (-df[t], t))
             if not row_tags and skip_empty:
                 n_skipped_empty += 1
                 continue
